@@ -518,7 +518,7 @@ server.tool(
       .describe("DevTools data types to capture, e.g. ['network', 'console', 'performance']"),
     action_mode: z
       .string()
-      .describe("Capture action mode: 'auto' | 'manual' | 'record'"),
+      .describe("Capture action mode: 'manual' | 'reload'"),
   },
   async ({ target, types, action_mode }) => {
     try {
