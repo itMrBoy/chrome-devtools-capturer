@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "chrome-devtools-capturer": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server/start.js"]
+    }
+  }
+}

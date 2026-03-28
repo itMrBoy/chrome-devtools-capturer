@@ -1,0 +1,10 @@
+{
+  "name": "chrome-devtools-capturer",
+  "version": "1.0.0",
+  "description": "Browser runtime capture & analysis for vibe coding — network, console, performance via MCP + Chrome extension",
+  "author": {
+    "name": "itMrBoy"
+  },
+  "repository": "https://github.com/itMrBoy/chrome-devtools-capturer",
+  "license": "MIT"
+}
