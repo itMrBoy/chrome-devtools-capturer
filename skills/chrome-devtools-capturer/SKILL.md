@@ -3,7 +3,7 @@ name: chrome-devtools-capturer
 description: >
   EXCLUSIVE browser debugging skill. Invoke FIRST for any browser-side issue: white screen, JS error, network error,
   console exception, performance problem. Orchestrates capture-analyze-cleanup pipeline via MCP.
-allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chrome-devtools-capturer__analyze_capture_results, mcp__chrome-devtools-capturer__cleanup_vibe_workspace
+allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chrome-devtools-capturer__analyze_capture_results, mcp__chrome-devtools-capturer__cleanup_vibe_workspace, Agent
 ---
 
 # chrome-devtools-capturer — MCP 工具使用指南
@@ -91,40 +91,87 @@ allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chro
 
 ---
 
-### Step 3 — 调用 `analyze_capture_results`
+### Step 3 — 委托 subAgent 分析并清理
 
-**触发时机：** 用户确认已完成浏览器操作后，立即调用。
+**触发时机：** 用户确认已完成浏览器操作后，立即执行。
 
-无参数，直接读取 `.vibeDevtools/latest_trace.json`。
+**为什么用 subAgent：** 捕获数据（trace JSON）可能非常大，直接在主对话中读取会消耗大量 token 并污染上下文。委托 subAgent 在隔离上下文中完成分析，只将精简结论返回主对话。
 
-**拿到数据后的分析重点：**
+使用 Agent tool 派出 subAgent，prompt 模板：
 
-针对 **network_logs**：
+```
+你是浏览器调试分析助手。请执行以下操作：
 
-- 找状态码异常（4xx/5xx）
-- 找耗时过长（`durationMs > 1000`）
-- 找请求头/响应头问题（CORS、认证）
-- 找未完成的请求（`status: null`）
+1. 调用 mcp__chrome-devtools-capturer__analyze_capture_results 读取捕获数据
 
-针对 **console_logs**：
+2. **数据质量检查**（在分析前必须先执行）：
 
-- 优先看 `level: "error"` 的条目
-- 关注 `source: "javascript"` 的异常，结合 `url` 和 `line` 定位源码
-- 看 `level: "warning"` 是否有预期外的弃用警告
+   读取 meta.stats 中的 network_count 和 console_count，按以下规则判断：
 
-分析时直接引用原始数据中的字段值作为证据，避免模糊结论。
+   a) **数据缺失**（工具返回"文件不存在"或无 meta 字段）：
+      → 判定：捕获数据未到达 MCP Server，可能原因：扩展未连接、WebSocket 断连、MCP Server 异常
+      → 返回结论时标记 data_quality: "missing"
+
+   b) **数据极少**（network_count == 0 且 console_count == 0）：
+      → 判定：高度疑似捕获失败（正常页面至少有 document 请求）
+      → 返回结论时标记 data_quality: "empty"
+
+   c) **数据偏少**（network_count < 3 或仅有 console_count 而用户报告的是网络问题）：
+      → 判定：可能是录制时间太短、未操作目标功能、或扩展 attach 晚于页面加载
+      → 返回结论时标记 data_quality: "sparse"
+
+   d) **数据正常**：
+      → 返回结论时标记 data_quality: "ok"
+
+3. 按以下维度分析数据（即使数据偏少也尽量分析已有内容）：
+
+   针对 network_logs：
+   - 状态码异常（4xx/5xx）— 列出 URL、status、statusText
+   - 耗时过长（durationMs > 1000）— 列出 URL 和耗时
+   - 请求头/响应头问题（CORS、认证）
+   - 未完成的请求（status: null）
+
+   针对 console_logs：
+   - level: "error" 的条目 — 列出 text、url、line
+   - source: "javascript" 的异常
+   - level: "warning" 中的弃用警告
+
+   针对 performance_logs（如果存在）：
+   - 长任务数量和总阻塞时间
+   - 耗时最长的子任务及其调用信息
+
+4. 分析完成后，调用 mcp__chrome-devtools-capturer__cleanup_vibe_workspace 清理数据
+
+5. 返回精简的分析报告，必须包含：
+   - data_quality 字段（missing / empty / sparse / ok）
+   - 如果 data_quality 不是 ok，附带可能原因说明
+   - 分析结论（直接引用原始数据字段值作为证据，避免模糊结论）
+```
+
+**主 agent 收到 subAgent 结论后，根据 data_quality 给出用户提示：**
+
+- `data_quality: "missing"` → 告知用户数据未采集到，建议：
+  1. 检查扩展图标是否显示 "RDY"（未显示说明 WS 未连接）
+  2. 运行 `/mcp` 确认 chrome-devtools-capturer 状态为 Connected
+  3. 重新调用 `prepare_capture_session` 再试一次
+
+- `data_quality: "empty"` → 告知用户录制期间未捕获到任何数据，建议：
+  1. 确认录制时扩展图标是否变为红色 "REC"
+  2. 确认操作的是目标页面（非其他 Tab）
+  3. 尝试使用 `action_mode: "reload"` 从页面加载开始捕获
+
+- `data_quality: "sparse"` → 告知用户数据较少，分析结论可能不完整，建议：
+  1. 延长录制时间，确保完整执行了目标操作
+  2. 如果问题发生在页面加载阶段，改用 `action_mode: "reload"`
+  3. 如果当前结论已足够定位问题，可以直接使用
+
+- `data_quality: "ok"` → 正常展示分析结论
+
+主 agent 收到 subAgent 返回的分析结论后，根据结果向用户提出修复建议或下一步行动。
 
 ---
 
-### Step 4 — 调用 `cleanup_vibe_workspace`
-
-**触发时机：** 分析完成后，紧接着调用，无需用户要求。
-
-> 这是"阅后即焚"原则的执行点。不清理旧数据会导致下一轮 `analyze_capture_results` 读到过期结果，让 LLM 产生错误分析。
-
----
-
-## 数据结构速查
+## 数据结构速查（供 subAgent 分析参考）
 
 ```
 latest_trace.json
@@ -137,11 +184,18 @@ latest_trace.json
 │   ├── status / statusText / mimeType
 │   ├── startTime / durationMs
 │   └── headers           ← Authorization/Cookie 已自动脱敏为 [MASKED]
-└── console_logs[]
-    ├── level             ← verbose | info | warning | error
-    ├── source            ← javascript | network | console-api | ...
-    ├── text / url / line
-    └── timestamp
+├── console_logs[]
+│   ├── level             ← verbose | info | warning | error
+│   ├── source            ← javascript | network | console-api | ...
+│   ├── text / url / line
+│   └── timestamp
+└── performance_logs（可选）
+    ├── summary
+    │   ├── totalLongTasks / totalBlockingTimeMs
+    │   └── mainThread { pid, tid }
+    └── longTasks[]
+        ├── durationMs / blockingTimeMs
+        └── heavySubTasks[] { name, durationMs, callInfo }
 ```
 
 ---
@@ -154,8 +208,8 @@ latest_trace.json
 用户：页面加载后 /api/user 一直 500，帮我看看
 → prepare_capture_session(target="http://...", types=["network"], action_mode="manual")
 → 引导用户录制页面加载
-→ analyze_capture_results() → 找 /api/user 的 status 和响应头
-→ cleanup_vibe_workspace()
+→ 用户确认完成后，派出 subAgent 分析 + 清理
+→ 主 agent 根据结论给出修复建议
 ```
 
 ### 场景 B：JS 异常定位
@@ -164,8 +218,8 @@ latest_trace.json
 用户：点击按钮后白屏了，控制台应该有报错
 → prepare_capture_session(target="http://...", types=["console"], action_mode="manual")
 → 引导用户录制点击操作
-→ analyze_capture_results() → 找 level:"error" + url + line 定位源码
-→ cleanup_vibe_workspace()
+→ subAgent 分析 → 找 level:"error" + url + line 定位源码
+→ 主 agent 定位代码并修复
 ```
 
 ### 场景 C：不确定问题类型
@@ -173,6 +227,7 @@ latest_trace.json
 ```
 用户：这个功能感觉怪怪的，帮我捕获一下
 → prepare_capture_session(target="...", types=["network","console"], action_mode="manual")
-→ 两类数据都抓，全面分析
-→ cleanup_vibe_workspace()
+→ 两类数据都抓
+→ subAgent 全面分析后返回精简结论
+→ 主 agent 综合判断问题根因
 ```
