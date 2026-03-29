@@ -526,9 +526,21 @@ server.tool(
       cleanWorkspace();
 
       const payload = { target, types, action_mode };
-      const sentTo = broadcast(payload);
+      let sentTo = broadcast(payload);
 
-      // 无扩展连接时明确告知，避免 Claude 误以为任务已成功下发
+      // 首次广播失败时，等待扩展 Service Worker 唤醒并重连（Manifest V3 会挂起 SW）
+      // 最多重试 3 次，每次间隔 2 秒，共等待约 6 秒
+      if (sentTo === 0) {
+        const MAX_RETRIES = 3;
+        const RETRY_INTERVAL_MS = 2000;
+        for (let i = 0; i < MAX_RETRIES && sentTo === 0; i++) {
+          process.stderr.write(`[WS] No extension connected, waiting for reconnect (${i + 1}/${MAX_RETRIES})...\n`);
+          await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
+          sentTo = broadcast(payload);
+        }
+      }
+
+      // 重试后仍无扩展连接，告知用户
       if (sentTo === 0) {
         return {
           content: [
