@@ -8,6 +8,8 @@
 
 Claude Code 的浏览器调试 Plugin —— 通过 MCP Server + Chrome 扩展，让 Claude 能够直接捕获和分析浏览器运行时数据（网络请求、控制台日志、性能 Tracing）。
 
+v1.1 新增了 `wait_for_capture_result` MCP Tool，实现 prepare → wait → analyze → cleanup 自动闭环。用户在浏览器中完成录制后，数据自动流入 Claude 分析，无需手动确认。
+
 本仓库包含：
 
 - **Skill 定义**（`skills/chrome-devtools-capturer/SKILL.md`）— Claude 识别浏览器调试场景时自动触发
@@ -32,6 +34,19 @@ chrome-devtools-capturer/          ← 本仓库（Plugin）
 ├── LICENSE
 └── README.md
 ```
+
+## 自动化改造
+
+### 新增 MCP Tool: `wait_for_capture_result`
+
+- **作用**：在 `prepare_capture_session` 之后自动阻塞等待，直到 Chrome 扩展上报的捕获数据到达 MCP Server
+- **原因**：之前用户需要在浏览器操作完成后回到 Claude 手动确认，中断了工作流。新 Tool 通过轮询 + MCP Progress Notification 保活机制，实现最长 10 分钟的自动等待
+- **技术实现**：每 2 秒轮询 `latest_trace.json`，同时通过 `sendProgress` 重置 MCP 客户端超时计时器
+
+### 新增 `pendingConfig` 配置暂存机制
+
+- **作用**：MCP Server 暂存最新配置，当 Chrome 扩展的 Service Worker 重连时自动下发
+- **原因**：Chrome Manifest V3 的 Service Worker 可能被挂起，醒来重连后原先的配置已丢失
 
 ## License
 

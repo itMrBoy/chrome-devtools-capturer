@@ -104,9 +104,10 @@ function cleanWorkspace() {
     }
     process.stderr.write(`[Cleanup] Cleared all files in ${WORKSPACE_DIR}\n`);
   }
-  // 同时重置 Tracing 落盘状态并清空暂存
+  // 同时重置 Tracing 落盘状态并清空所有暂存
   resetTracingState();
   pendingCaptureResult = null;
+  pendingConfig = null;
   ensureWorkspaceDir();
 }
 
@@ -311,6 +312,18 @@ function extractLongTasks(traceEvents) {
  */
 let pendingCaptureResult = null;
 
+/**
+ * 暂存最新的捕获配置，用于 WS 新连接自动下发。
+ *
+ * 解决的问题：Chrome 扩展的 Service Worker 可能在 MCP Server broadcast 配置后
+ * 被挂起并重连，导致配置丢失。新连接建立时自动下发暂存的配置，
+ * 确保扩展无论何时重连都能收到最新配置并进入 ARMED 状态。
+ *
+ * 生命周期：prepare_capture_session 时设置，capture_result 到达或 cleanWorkspace 时清除。
+ * @type {object|null}
+ */
+let pendingConfig = null;
+
 // ── WebSocket Server ────────────────────────────────────────────────────────
 
 const WS_PORT = 8765;
@@ -333,9 +346,16 @@ wss.on("listening", () => {
 wss.on("connection", (ws) => {
   process.stderr.write("[WS] Chrome extension connected\n");
 
+  // 新连接时自动下发暂存的捕获配置（解决 SW 重连后配置丢失问题）
+  if (pendingConfig) {
+    ws.send(JSON.stringify(pendingConfig));
+    process.stderr.write("[WS] Pending config auto-sent to new client\n");
+  }
+
   /**
    * 监听扩展上报的消息，按类型分流处理：
    *
+   * - keepalive:        心跳消息，静默忽略（仅用于保活 SW）
    * - tracing_chunk:    流式 Tracing 数据块，逐条追加写入 raw_trace.jsonl（NDJSON 格式）
    * - tracing_complete: Tracing 结束信号，从 .jsonl 文件逐行读取 → 脱水算法 → 写入结果 → 删除临时文件
    * - capture_result:   网络/日志数据，暂存等待合并或直接落盘
@@ -344,6 +364,9 @@ wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
     try {
       const parsed = JSON.parse(raw.toString());
+
+      // ── 心跳消息 → 静默忽略 ──────────────────────────────────────────
+      if (parsed.type === "keepalive") return;
 
       // ── 流式 Tracing 数据块 → 追加写入 NDJSON 文件 ──────────────────
       if (parsed.type === "tracing_chunk") {
@@ -414,6 +437,8 @@ wss.on("connection", (ws) => {
 
       // ── 网络/日志捕获结果 ───────────────────────────────────────────
       if (parsed.type === "capture_result") {
+        // 数据已到达，清除待下发配置（本轮捕获完成）
+        pendingConfig = null;
         // 移除 type 字段，不写入文件
         delete parsed.type;
 
@@ -526,6 +551,7 @@ server.tool(
       cleanWorkspace();
 
       const payload = { target, types, action_mode };
+      pendingConfig = payload; // 暂存配置，供扩展重连时自动下发
       let sentTo = broadcast(payload);
 
       // 首次广播失败时，等待扩展 Service Worker 唤醒并重连（Manifest V3 会挂起 SW）
@@ -585,7 +611,105 @@ server.tool(
   }
 );
 
-// ── Tool 2: analyze_capture_results ────────────────────────────────────────
+// ── Tool 2: wait_for_capture_result ───────────────────────────────────────
+
+/**
+ * 阻塞等待 Chrome 扩展的捕获数据到达，轮询 latest_trace.json 直到文件出现。
+ *
+ * 设计动机：
+ *   在自动化工作流中，Claude 调用 prepare_capture_session 后需要等待用户在浏览器中
+ *   完成操作并停止录制。此 Tool 替代人工确认环节，实现 prepare → wait → analyze 自动闭环。
+ *
+ * 实现策略：
+ *   - 每 2 秒轮询一次 TRACE_FILE 是否存在
+ *   - 同时检查 tracingInProgress 标志，确保性能数据已完成脱水合并
+ *   - 通过 sendProgress 定期发送进度通知，重置 MCP 客户端的超时计时器
+ *   - 超时后优雅返回提示信息，不抛异常
+ *
+ * 典型调用场景：
+ *   prepare_capture_session → wait_for_capture_result → （subAgent 分析）→ cleanup
+ */
+server.tool(
+  "wait_for_capture_result",
+  "Block until the Chrome extension uploads capture data, then return the result. Uses progress notifications to prevent timeout.",
+  {
+    timeout_seconds: z
+      .number()
+      .default(600)
+      .describe("Maximum seconds to wait for capture data (default: 600, i.e. 10 minutes)"),
+  },
+  async ({ timeout_seconds }, extra) => {
+    const POLL_INTERVAL_MS = 2000;
+    const deadline = Date.now() + timeout_seconds * 1000;
+    let tick = 0;
+    const totalTicks = Math.ceil(timeout_seconds * 1000 / POLL_INTERVAL_MS);
+
+    process.stderr.write(`[Wait] Polling for capture result (timeout=${timeout_seconds}s)...\n`);
+
+    while (Date.now() < deadline) {
+      // 发送 progress 通知，重置客户端超时计时器
+      try {
+        await extra.sendProgress({ progress: tick++, total: totalTicks });
+      } catch {
+        // sendProgress 在客户端未传 progressToken 时可能失败，静默忽略
+      }
+
+      // 检查数据是否就绪：文件存在 且 Tracing 脱水已完成
+      if (fs.existsSync(TRACE_FILE) && !tracingInProgress) {
+        process.stderr.write(`[Wait] Capture result ready after ${tick * 2}s\n`);
+        try {
+          const content = fs.readFileSync(TRACE_FILE, "utf-8");
+          return {
+            content: [{ type: "text", text: content }],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `❌ 读取捕获结果失败：${err.message}` }],
+            isError: true,
+          };
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+
+    // 超时：区分"文件存在但 Tracing 未完成"和"完全没数据"两种情况
+    if (fs.existsSync(TRACE_FILE)) {
+      process.stderr.write("[Wait] Timeout but file exists, tracing may still be in progress\n");
+      const content = fs.readFileSync(TRACE_FILE, "utf-8");
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "⚠️  等待超时，但已有部分捕获数据（性能数据可能仍在处理中）。以下是当前可用数据：",
+              "",
+              content,
+            ].join("\n"),
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `⏰ 等待 ${timeout_seconds} 秒后超时，未收到捕获数据。`,
+            "",
+            "可能原因：",
+            "1. 扩展未连接 — 检查扩展图标是否显示 RDY（琥珀色）",
+            "2. 用户尚未操作 — 请在浏览器中按 Alt+Shift+C 开始/停止录制",
+            "3. WebSocket 断开 — 检查 MCP Server 日志是否有连接信息",
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ── Tool 3 (legacy): analyze_capture_results ────────────────────────────────────────
 
 /**
  * 读取扩展上报并落盘的捕获结果，以文本形式返回给 Claude 分析。
@@ -630,7 +754,7 @@ server.tool(
   }
 );
 
-// ── Tool 3: cleanup_vibe_workspace ─────────────────────────────────────────
+// ── Tool 4: cleanup_vibe_workspace ─────────────────────────────────────────
 
 /**
  * 删除 latest_trace.json，实现"阅后即焚"。

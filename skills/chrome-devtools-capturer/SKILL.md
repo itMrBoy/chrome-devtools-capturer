@@ -3,7 +3,7 @@ name: chrome-devtools-capturer
 description: >
   EXCLUSIVE browser debugging skill. Invoke FIRST for any browser-side issue: white screen, JS error, network error,
   console exception, performance problem. Orchestrates capture-analyze-cleanup pipeline via MCP.
-allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chrome-devtools-capturer__analyze_capture_results, mcp__chrome-devtools-capturer__cleanup_vibe_workspace, Agent
+allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chrome-devtools-capturer__wait_for_capture_result, mcp__chrome-devtools-capturer__analyze_capture_results, mcp__chrome-devtools-capturer__cleanup_vibe_workspace, Agent
 ---
 
 # chrome-devtools-capturer — MCP 工具使用指南
@@ -31,13 +31,14 @@ allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chro
 
 ## 工具概览
 
-共 3 个 MCP Tools，形成**阅后即焚**的闭环：
+共 4 个 MCP Tools，形成**自动闭环 + 阅后即焚**的工作流：
 
-| Tool                      | 何时调用                 |
-| ------------------------- | -------------------- |
-| `prepare_capture_session` | 需要浏览器数据之前，第一步调用      |
-| `analyze_capture_results` | 用户完成浏览器操作、数据已上报之后    |
-| `cleanup_vibe_workspace`  | 分析完毕，立即清理，防止旧数据污染下一轮 |
+| Tool                       | 何时调用                                      |
+| -------------------------- | ----------------------------------------- |
+| `prepare_capture_session`  | 需要浏览器数据之前，第一步调用                           |
+| `wait_for_capture_result`  | prepare 之后立即调用，自动阻塞等待数据到达（替代人工确认）          |
+| `analyze_capture_results`  | 手动模式下使用：用户确认完成浏览器操作后调用（自动模式下由 wait_for 替代）|
+| `cleanup_vibe_workspace`   | 分析完毕，立即清理，防止旧数据污染下一轮                      |
 
 ---
 
@@ -79,51 +80,62 @@ allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chro
 
 ---
 
-### Step 2 — 等待用户操作浏览器
+### Step 2 — 自动等待捕获数据
 
-这一步不调用任何工具。等待用户说"好了"、"操作完了"、"录制结束"等信号。
+**在 Step 1 给出操作引导后，立即调用 `wait_for_capture_result`：**
 
-如果用户说扩展没有反应：
+```json
+{
+  "timeout_seconds": 600
+}
+```
 
-- 提醒检查 MCP Server 是否在运行：`node mcp-server/index.js`
-- 提醒扩展是否已加载（`chrome://extensions/` 开发者模式）
-- 扩展图标应显示 "RDY" 才能录制
+此 Tool 会自动阻塞等待 Chrome 扩展上报数据（每 2 秒轮询一次），**无需等待用户回来确认**。
+它通过 MCP progress notification 定期重置超时计时器，支持长时间等待。
+
+**三种返回结果：**
+
+| 结果 | 含义 | 后续动作 |
+|---|---|---|
+| 返回 JSON 数据 | 捕获成功，数据已就绪 | 进入 Step 3 分析 |
+| 返回"部分数据"警告 | 超时但文件已存在（Tracing 可能仍在处理） | 仍可进入 Step 3 分析已有数据 |
+| 返回"超时无数据" | 扩展未录制或连接异常 | 向用户展示排查建议 |
 
 ---
 
 ### Step 3 — 委托 subAgent 分析并清理
 
-**触发时机：** 用户确认已完成浏览器操作后，立即执行。
+**触发时机：** Step 2 返回了捕获数据后，立即执行。
 
 **为什么用 subAgent：** 捕获数据（trace JSON）可能非常大，直接在主对话中读取会消耗大量 token 并污染上下文。委托 subAgent 在隔离上下文中完成分析，只将精简结论返回主对话。
+
+**注意：** 由于 `wait_for_capture_result` 已经返回了数据，subAgent **不需要再调用 `analyze_capture_results`**，直接分析 Step 2 返回的数据即可。
 
 使用 Agent tool 派出 subAgent，prompt 模板：
 
 ```
-你是浏览器调试分析助手。请执行以下操作：
+你是浏览器调试分析助手。请分析以下捕获数据并执行清理：
 
-1. 调用 mcp__chrome-devtools-capturer__analyze_capture_results 读取捕获数据
+<capture_data>
+{这里粘贴 wait_for_capture_result 返回的数据}
+</capture_data>
 
-2. **数据质量检查**（在分析前必须先执行）：
+1. **数据质量检查**（在分析前必须先执行）：
 
    读取 meta.stats 中的 network_count 和 console_count，按以下规则判断：
 
-   a) **数据缺失**（工具返回"文件不存在"或无 meta 字段）：
-      → 判定：捕获数据未到达 MCP Server，可能原因：扩展未连接、WebSocket 断连、MCP Server 异常
-      → 返回结论时标记 data_quality: "missing"
-
-   b) **数据极少**（network_count == 0 且 console_count == 0）：
+   a) **数据极少**（network_count == 0 且 console_count == 0）：
       → 判定：高度疑似捕获失败（正常页面至少有 document 请求）
       → 返回结论时标记 data_quality: "empty"
 
-   c) **数据偏少**（network_count < 3 或仅有 console_count 而用户报告的是网络问题）：
+   b) **数据偏少**（network_count < 3 或仅有 console_count 而用户报告的是网络问题）：
       → 判定：可能是录制时间太短、未操作目标功能、或扩展 attach 晚于页面加载
       → 返回结论时标记 data_quality: "sparse"
 
-   d) **数据正常**：
+   c) **数据正常**：
       → 返回结论时标记 data_quality: "ok"
 
-3. 按以下维度分析数据（即使数据偏少也尽量分析已有内容）：
+2. 按以下维度分析数据（即使数据偏少也尽量分析已有内容）：
 
    针对 network_logs：
    - 状态码异常（4xx/5xx）— 列出 URL、status、statusText
@@ -140,20 +152,15 @@ allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chro
    - 长任务数量和总阻塞时间
    - 耗时最长的子任务及其调用信息
 
-4. 分析完成后，调用 mcp__chrome-devtools-capturer__cleanup_vibe_workspace 清理数据
+3. 分析完成后，调用 mcp__chrome-devtools-capturer__cleanup_vibe_workspace 清理数据
 
-5. 返回精简的分析报告，必须包含：
-   - data_quality 字段（missing / empty / sparse / ok）
+4. 返回精简的分析报告，必须包含：
+   - data_quality 字段（empty / sparse / ok）
    - 如果 data_quality 不是 ok，附带可能原因说明
    - 分析结论（直接引用原始数据字段值作为证据，避免模糊结论）
 ```
 
 **主 agent 收到 subAgent 结论后，根据 data_quality 给出用户提示：**
-
-- `data_quality: "missing"` → 告知用户数据未采集到，建议：
-  1. 检查扩展图标是否显示 "RDY"（未显示说明 WS 未连接）
-  2. 运行 `/mcp` 确认 chrome-devtools-capturer 状态为 Connected
-  3. 重新调用 `prepare_capture_session` 再试一次
 
 - `data_quality: "empty"` → 告知用户录制期间未捕获到任何数据，建议：
   1. 确认录制时扩展图标是否变为红色 "REC"
@@ -166,6 +173,8 @@ allowed-tools: mcp__chrome-devtools-capturer__prepare_capture_session, mcp__chro
   3. 如果当前结论已足够定位问题，可以直接使用
 
 - `data_quality: "ok"` → 正常展示分析结论
+
+**如果 Step 2 返回超时无数据（未进入 Step 3）：** 直接向用户展示 wait_for_capture_result 返回的排查建议，询问是否重试。
 
 主 agent 收到 subAgent 返回的分析结论后，根据结果向用户提出修复建议或下一步行动。
 
@@ -207,8 +216,8 @@ latest_trace.json
 ```
 用户：页面加载后 /api/user 一直 500，帮我看看
 → prepare_capture_session(target="http://...", types=["network"], action_mode="manual")
-→ 引导用户录制页面加载
-→ 用户确认完成后，派出 subAgent 分析 + 清理
+→ 引导用户操作后，立即调用 wait_for_capture_result(timeout_seconds=120)
+→ 数据自动到达 → 派出 subAgent 分析 + 清理
 → 主 agent 根据结论给出修复建议
 ```
 
@@ -217,7 +226,7 @@ latest_trace.json
 ```
 用户：点击按钮后白屏了，控制台应该有报错
 → prepare_capture_session(target="http://...", types=["console"], action_mode="manual")
-→ 引导用户录制点击操作
+→ wait_for_capture_result 自动等待录制完成
 → subAgent 分析 → 找 level:"error" + url + line 定位源码
 → 主 agent 定位代码并修复
 ```
@@ -227,7 +236,7 @@ latest_trace.json
 ```
 用户：这个功能感觉怪怪的，帮我捕获一下
 → prepare_capture_session(target="...", types=["network","console"], action_mode="manual")
-→ 两类数据都抓
+→ wait_for_capture_result 自动等待
 → subAgent 全面分析后返回精简结论
 → 主 agent 综合判断问题根因
 ```
