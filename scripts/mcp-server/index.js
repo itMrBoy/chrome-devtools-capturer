@@ -52,6 +52,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import readline from "readline";
+import { execSync } from "child_process";
 
 // ── 路径初始化 ──────────────────────────────────────────────────────────────
 
@@ -329,6 +330,63 @@ let pendingConfig = null;
 const WS_PORT = 8765;
 
 /**
+ * 检测指定端口是否被占用，若被占用则尝试终止占用进程。
+ * 跨平台支持：Windows 使用 netstat + taskkill，Unix 使用 lsof + kill。
+ *
+ * @param {number} port - 要检测的端口号
+ * @returns {boolean} true = 端口已可用（无占用或已成功终止）；false = 无法释放
+ */
+function ensurePortAvailable(port) {
+  const isWin = process.platform === "win32";
+  let pid;
+  try {
+    if (isWin) {
+      // netstat -ano 输出示例: "  TCP    0.0.0.0:8765    0.0.0.0:0    LISTENING    12345"
+      const output = execSync(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const match = output.trim().split("\n")[0]?.match(/(\d+)\s*$/);
+      pid = match ? parseInt(match[1], 10) : null;
+    } else {
+      // lsof 输出示例: "node    12345 user   20u  IPv6 ... TCP *:8765 (LISTEN)"
+      const output = execSync(`lsof -i :${port} -t`, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      pid = parseInt(output.trim().split("\n")[0], 10) || null;
+    }
+  } catch {
+    // 命令执行失败 = 端口未被占用
+    return true;
+  }
+
+  if (!pid || pid === process.pid) return true;
+
+  process.stderr.write(
+    `[WS] ⚠️ Port ${port} is occupied by PID ${pid}. Attempting to kill...\n`
+  );
+  try {
+    if (isWin) {
+      execSync(`taskkill /PID ${pid} /F`, { stdio: ["pipe", "pipe", "pipe"] });
+    } else {
+      execSync(`kill -9 ${pid}`, { stdio: ["pipe", "pipe", "pipe"] });
+    }
+    process.stderr.write(`[WS] ✅ Successfully killed PID ${pid}, port ${port} released.\n`);
+    return true;
+  } catch (err) {
+    process.stderr.write(
+      `[WS] ❌ Failed to kill PID ${pid}: ${err.message}\n` +
+      `[WS] Please manually stop the process occupying port ${port} and restart.\n`
+    );
+    return false;
+  }
+}
+
+// 启动前检测端口冲突
+ensurePortAvailable(WS_PORT);
+
+/**
  * 创建 WebSocket 服务端，等待 Chrome 扩展通过 new WebSocket("ws://localhost:8765") 连接。
  * 此 Server 与 MCP stdio 传输完全独立，互不干扰。
  * wss.clients 会自动维护所有活跃连接的集合，供 broadcast() 遍历。
@@ -337,6 +395,16 @@ const wss = new WebSocketServer({ port: WS_PORT });
 
 wss.on("listening", () => {
   process.stderr.write(`[WS] WebSocket server listening on ws://localhost:${WS_PORT}\n`);
+});
+
+wss.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    process.stderr.write(
+      `[WS] ❌ Port ${WS_PORT} is still in use after cleanup attempt.\n` +
+      `[WS] Please manually stop the process occupying port ${WS_PORT} and restart.\n`
+    );
+    process.exit(1);
+  }
 });
 
 /**
